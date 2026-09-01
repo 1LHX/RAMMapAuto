@@ -2,8 +2,10 @@
 #  RAMMap 自动清理 —— 托盘常驻程序
 # ----------------------------------------------------------------------------
 #  功能一览：
-#    · 常规定时清理：默认每 30 分钟清空进程工作集（间隔可调）
-#    · 内存监控：定时检查物理内存占用，超过阈值（默认 80%）立即清理
+#    · 定时保养：默认每 30 分钟清理一次，仅在占用 60%-80% 区间生效
+#      （低于低占用线跳过；超阈值时由内存监控接管）
+#    · 内存监控：默认每 5 分钟检查占用，超过阈值（默认 80%）立即清理
+#    · 手动清理：菜单/双击托盘，无条件执行，不受任何阈值限制
 #    · 游戏保护模式：检测到游戏运行时，自动改为逐进程清理，
 #      绝不动游戏与系统关键进程，防止游戏因内存被换出而卡死
 #    · 参数设置：托盘菜单中可随时调整 间隔 / 检查频率 / 阈值，持久化保存
@@ -28,7 +30,7 @@ $script:intervalMinutes      = 30    # 常规自动清理间隔（分钟），�
 $script:checkIntervalMinutes = 5     # 内存占用检查间隔（分钟），范围 1-60
                                       #   注：该值同时是两次清理的最小冷却时间（防抖）
 $script:memThresholdPercent  = 80    # 内存占用阈值（%），超过则立即清理，范围 50-95
-$script:skipBelowPercent     = 60    # 占用低于此值（%）时跳过常规/定时清理（内存充裕，换页得不偿失），范围 0-90
+$script:skipBelowPercent     = 60    # 占用低于此值（%）时跳过定时保养/启动清理（内存充裕，换页得不偿失），范围 0-90
                                       #   注：仅跳过"定时/手动"类触发；内存监控超阈值触发与启动清理不受限
 $script:minWorkingSetMB      = 50    # 逐进程清理时，工作集小于此值（MB）的进程跳过
 $script:autoStartEnabled     = $true # 开机自启偏好（菜单切换后持久化；配置无此键时默认开启）
@@ -218,7 +220,7 @@ if (-not $script:rammapPath) {
 }
 
 Write-Log "==== 托盘程序启动（管理员）: $script:rammapPath ===="
-Write-Log ("配置: 常规清理每 {0} 分钟; 每 {1} 分钟检查内存, 占用超过 {2}% 立即清理; 占用低于 {3}% 跳过定时清理" -f `
+Write-Log ("配置: 定时保养每 {0} 分钟(仅占用 {3}%-{2}% 区间); 内存监控每 {1} 分钟检查, 占用超过 {2}% 立即清理; 占用低于 {3}% 时定时保养/启动清理自动跳过" -f `
     $script:intervalMinutes, $script:checkIntervalMinutes, $script:memThresholdPercent, $script:skipBelowPercent)
 
 # ============================================================================
@@ -434,8 +436,8 @@ $script:notify.Text = 'RAMMap 自动清理'
 # 更新托盘悬停提示（NotifyIcon.Text 上限 63 字符，超限会抛异常）
 # 注：换行需用 "`r"（Windows tooltip 识别 CR 而非 LF，原 "-replace '\s+'" 会把换行折叠成空格）
 function Update-Tip($extra) {
-    $auto = if ($script:timer.Enabled) { "每${script:intervalMinutes}分钟" } else { '定时暂停' }
-    $mem  = if ($script:miMem -and $script:miMem.Checked) { "监控开" } else { '监控关' }
+    $auto = if ($script:timer.Enabled) { "保养${script:intervalMinutes}分" } else { '保养关' }
+    $mem  = if ($script:miMem -and $script:miMem.Checked) { "监控${script:memThresholdPercent}%" } else { '监控关' }
     $game = if (Test-GameRunning) { '游戏保护中' } else { '' }
     $line1 = "RAMMap $auto $mem $game".Trim() -replace '\s+', ' '
     $line2 = "$extra".Trim() -replace '\s+', ' '
@@ -489,13 +491,16 @@ $script:checkTimer.Add_Tick({
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 
 # 菜单文字统一在此刷新（参数修改后联动更新，各处实时显示当前值）
+# 文案区分两条自动清理链路：
+#   · 定时保养：低占用线(默认60%)与清理阈值(默认80%)之间的周期性清理
+#   · 内存监控：占用超清理阈值(默认80%)时的高频快速响应
 function Refresh-MenuTexts {
-    $script:miAuto.Text         = "自动清理（每 $($script:intervalMinutes) 分钟）"
-    $script:miMem.Text          = "内存监控（占用超 $($script:memThresholdPercent)% 立即清理）"
-    $script:miSetInterval.Text  = "自动清理间隔…… $($script:intervalMinutes) 分钟"
+    $script:miAuto.Text         = "定时保养（每 $($script:intervalMinutes) 分钟，占用 ${script:skipBelowPercent}%-${script:memThresholdPercent}% 之间）"
+    $script:miMem.Text          = "内存监控（每 $($script:checkIntervalMinutes) 分钟检查，超 $($script:memThresholdPercent)% 立即清理）"
+    $script:miSetInterval.Text  = "定时保养间隔…… $($script:intervalMinutes) 分钟"
     $script:miSetCheck.Text     = "内存检查间隔…… $($script:checkIntervalMinutes) 分钟"
-    $script:miSetThreshold.Text = "清理阈值……超过 $($script:memThresholdPercent)%"
-    $script:miSetSkip.Text      = "低占用跳过……低于 $($script:skipBelowPercent)% 不清"
+    $script:miSetThreshold.Text = "清理阈值……超过 $($script:memThresholdPercent)% 立即清理"
+    $script:miSetSkip.Text      = "低占用跳过……低于 $($script:skipBelowPercent)% 不自动清理"
 }
 
 # 参数输入框：弹 InputBox 并校验范围，返回新值；取消/非法输入返回 $null
@@ -515,16 +520,16 @@ $miNow.Add_Click({ Invoke-Cleanup '手动' })
 $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
 
 # --- [开关] 自动清理（定时器 A） ---
-$script:miAuto = New-Object System.Windows.Forms.ToolStripMenuItem("自动清理（每 $script:intervalMinutes 分钟）")
+$script:miAuto = New-Object System.Windows.Forms.ToolStripMenuItem("定时保养（每 $script:intervalMinutes 分钟，占用 $script:skipBelowPercent%-$script:memThresholdPercent% 之间）")
 $script:miAuto.CheckOnClick = $true
 $script:miAuto.Checked = $script:autoCleanEnabled   # 从持久化配置恢复
 $script:miAuto.Add_Click({
     if ($script:miAuto.Checked) {
         $script:timer.Start()
-        Write-Log '自动清理: 已开启'
+        Write-Log "定时保养: 已开启（每 $script:intervalMinutes 分钟, 占用 ${script:skipBelowPercent}%-${script:memThresholdPercent}% 区间）"
     } else {
         $script:timer.Stop()
-        Write-Log '自动清理: 已暂停'
+        Write-Log '定时保养: 已暂停'
     }
     $script:autoCleanEnabled = $script:miAuto.Checked   # 偏好持久化，重启不丢
     Save-Config
@@ -539,7 +544,7 @@ $script:miMem.Checked = $script:memWatchEnabled   # 从持久化配置恢复
 $script:miMem.Add_Click({
     if ($script:miMem.Checked) {
         $script:checkTimer.Start()
-        Write-Log "内存监控: 已开启（每 $($script:checkIntervalMinutes) 分钟检查, 超过 $($script:memThresholdPercent)% 清理）"
+        Write-Log "内存监控: 已开启（每 $($script:checkIntervalMinutes) 分钟检查, 占用超过 $($script:memThresholdPercent)% 立即清理）"
     } else {
         $script:checkTimer.Stop()
         Write-Log '内存监控: 已关闭'
@@ -607,7 +612,7 @@ $script:miSetThreshold.Add_Click({
 
 $script:miSetSkip = $miSettings.DropDownItems.Add('低占用跳过')
 $script:miSetSkip.Add_Click({
-    $n = Show-ParamInput '低占用跳过' "占用低于多少百分比时跳过定时清理（0-90，0=不跳过）：" $script:skipBelowPercent 0 90
+    $n = Show-ParamInput '低占用跳过' "占用低于多少百分比时跳过自动清理（定时保养与启动清理受此限制）（0-90，0=不跳过）：" $script:skipBelowPercent 0 90
     if ($n -ne $null) {
         $script:skipBelowPercent = $n
         Save-Config; Refresh-MenuTexts
@@ -655,7 +660,7 @@ $script:notify.Add_DoubleClick({ Invoke-Cleanup '手动' })
 # 1) 托盘图标 + 气泡立即显示（先给用户反馈，再做耗时工作；
 #    内存查询 CIM 调用较慢，初始提示先省略，异步清理完成后会刷新）
 $script:notify.BalloonTipTitle = 'RAMMap 自动清理已在后台运行'
-$script:notify.BalloonTipText  = "每 $script:intervalMinutes 分钟自动清理；每 $script:checkIntervalMinutes 分钟检查内存，占用超 $script:memThresholdPercent% 立即清理`n右键托盘图标可调整或退出"
+$script:notify.BalloonTipText  = "定时保养：每 $script:intervalMinutes 分钟（占用 ${script:skipBelowPercent}%-${script:memThresholdPercent}% 之间）`n内存监控：每 $script:checkIntervalMinutes 分钟检查，超 $script:memThresholdPercent% 立即清理`n右键托盘图标可调整或退出"
 $script:notify.Visible = $true
 $script:notify.ShowBalloonTip(4000)
 
