@@ -182,9 +182,16 @@ if (-not $isAdmin) {
 # 绝不结束旧实例——避免误杀导致的清理中断/状态丢失。
 # 跨进程通知用命名 EventWaitHandle：新实例 Set 信号，旧实例轮询收到后弹提示。
 function New-TrayMutex {
+    # 返回 $true = 成功持有锁（$script:mutex 保留句柄，进程生命周期内持有）
+    #       $false = 锁被占用或创建失败（句柄立即释放并置空，防止句柄泄漏）
+    # 注：Mutex 构造在锁被占时仍会成功创建对象（只是没抢到），不能靠对象判空！
     $created = $false
-    try { $script:mutex = New-Object System.Threading.Mutex($true, $script:mutexName, [ref]$created) } catch { $created = $false }
-    $created
+    $m = $null
+    try { $m = New-Object System.Threading.Mutex($true, $script:mutexName, [ref]$created) } catch { }
+    if ($created) { $script:mutex = $m; return $true }
+    if ($m) { $m.Dispose() }
+    $script:mutex = $null
+    return $false
 }
 if (-not (New-TrayMutex)) {
     # 通知已运行的实例露个脸，让用户知道"刚才那次双击其实被保护了"
@@ -192,10 +199,14 @@ if (-not (New-TrayMutex)) {
         $evt = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, $script:mutexName + '_ping')
         $evt.Set(); $evt.Dispose()
     } catch { }
-    # 重试窗口：旧实例若正在退出（如用户点了重启），给点时间释放锁；
-    # 15 秒内每秒试一次，拿不到就放弃（静默退出，不打扰用户）
-    for ($i = 0; $i -lt 15 -and -not (New-TrayMutex); $i++) { Start-Sleep -Seconds 1 }
-    if (-not $script:mutex) { exit }
+    # 重试窗口：仅服务于"旧实例正在退出"的场景（如用户点了重启菜单，等它放锁），
+    # 每秒试一次共 15 秒；超时仍拿不到说明旧实例健在 -> 静默退出，绝不抢跑
+    $acquired = $false
+    for ($i = 0; $i -lt 15 -and -not $acquired; $i++) {
+        Start-Sleep -Seconds 1
+        if (New-TrayMutex) { $acquired = $true }
+    }
+    if (-not $acquired) { exit }
 }
 
 # ============================================================================
