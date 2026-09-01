@@ -39,6 +39,7 @@ Windows 内存自动清理托盘常驻工具。基于 PowerShell + [Sysinternals
 打开 RAMMap 窗口
 查看日志
 ────────────
+重启托盘程序
 退出
 ```
 
@@ -78,7 +79,7 @@ Windows 内存自动清理托盘常驻工具。基于 PowerShell + [Sysinternals
 ## 工作原理
 
 1. **无 UAC 常驻**：首次运行注册计划任务（最高权限 + 登录触发），之后 `wscript` 静默启动 PowerShell 脚本，借 `schtasks /run` 触发提权实例，全程无弹窗
-2. **单实例接管**：互斥锁保证单实例，重复启动会结束旧实例并接管
+2. **单实例保护**：互斥锁保证单实例；已有实例运行时重复启动仅弹气泡提醒"已在运行"，不打扰旧实例。托盘菜单提供一键重启（新实例直接以管理员身份接管）
 3. **清理机制**：`RAMMap -Ew` 或 `EmptyWorkingSet`（等价 `SetProcessWorkingSetSize(-1,-1)`）将工作集页面移出物理内存，逼迫系统释放 standby list 供活跃进程使用
 
 ## 文件说明

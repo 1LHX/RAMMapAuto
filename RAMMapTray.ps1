@@ -11,6 +11,8 @@
 #    · 参数设置：托盘菜单中可随时调整 间隔 / 检查频率 / 阈值，持久化保存
 #    · 开机自启：借道计划任务以最高权限静默启动，全程无 UAC 弹窗
 #    · 无窗口常驻：右下角托盘图标 + 右键菜单控制一切
+#    · 单实例保护：已有实例运行时重复启动仅弹气泡提醒，不打扰旧实例
+#    · 托盘重启：菜单一键重启，新实例直接以管理员身份无缝接管
 #
 #  文件说明（均与本脚本同目录）：
 #    RAMMapTray.ps1            本脚本（需 UTF-8 BOM 编码）
@@ -56,7 +58,7 @@ $script:logFile   = Join-Path $PSScriptRoot 'rammap_auto.log'          # 日志�
 $script:configFile = Join-Path $PSScriptRoot 'rammap_tray_config.json' # 参数持久化文件
 $script:vbsPath   = Join-Path $PSScriptRoot '启动RAMMap自动清理.vbs'    # 无窗口启动器
 $script:taskName  = 'RAMMapAutoTray'                                   # 开机自启计划任务名
-$script:mutexName = 'RAMMapAutoTray'                                   # 单实例互斥锁名
+$script:mutexName = 'RAMMapAutoTray'                                   # 单实例互斥锁名（加 _ping 后缀为跨实例通知事件名）
 
 # 运行时状态（无需改动）
 $script:lastCleanup = Get-Date   # 上次清理时间，用于清理防抖
@@ -175,23 +177,25 @@ if (-not $isAdmin) {
     exit
 }
 
-# --- 4.2 单实例（接管模式）---
-# 若互斥锁被占用，说明已有实例在运行：结束旧实例 -> 释放锁 -> 自己接管。
-# 这样"双击快捷方式"永远有响应（表现为重启托盘程序），而不是静默退出。
+# --- 4.2 单实例（保护模式）---
+# 若互斥锁被占用，说明已有实例在运行：通知对方（弹气泡提醒"已在运行"）后自己退出，
+# 绝不结束旧实例——避免误杀导致的清理中断/状态丢失。
+# 跨进程通知用命名 EventWaitHandle：新实例 Set 信号，旧实例轮询收到后弹提示。
 function New-TrayMutex {
     $created = $false
     try { $script:mutex = New-Object System.Threading.Mutex($true, $script:mutexName, [ref]$created) } catch { $created = $false }
     $created
 }
 if (-not (New-TrayMutex)) {
-    # 只杀命令行中含本脚本完整路径的实例，避免误伤无关 powershell 进程
-    $me = [regex]::Escape($PSCommandPath)
-    Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -and $_.CommandLine -match $me } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    Start-Sleep -Seconds 2                 # 等旧实例完全退出、锁真正释放
-    $script:mutex.Dispose()
-    if (-not (New-TrayMutex)) { exit }     # 仍拿不到锁则放弃启动
+    # 通知已运行的实例露个脸，让用户知道"刚才那次双击其实被保护了"
+    try {
+        $evt = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, $script:mutexName + '_ping')
+        $evt.Set(); $evt.Dispose()
+    } catch { }
+    # 重试窗口：旧实例若正在退出（如用户点了重启），给点时间释放锁；
+    # 15 秒内每秒试一次，拿不到就放弃（静默退出，不打扰用户）
+    for ($i = 0; $i -lt 15 -and -not (New-TrayMutex); $i++) { Start-Sleep -Seconds 1 }
+    if (-not $script:mutex) { exit }
 }
 
 # ============================================================================
@@ -485,6 +489,26 @@ $script:checkTimer.Add_Tick({
     }
 })
 
+# 定时器 C：单实例 ping 监听（500ms 轮询）
+#   用户在已有实例运行时再次双击快捷方式，新实例会 Set 命名事件后退出；
+#   旧实例在此收到信号，弹气泡告知"已在运行"（替代旧版"杀掉接管"的粗暴方式）
+$script:pingEvent = $null
+try {
+    $script:pingEvent = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, $script:mutexName + '_ping')
+} catch { }
+if ($script:pingEvent) {
+    $script:pingTimer = New-Object System.Windows.Forms.Timer
+    $script:pingTimer.Interval = 500
+    $script:pingTimer.Add_Tick({
+        if ($script:pingEvent.WaitOne(0)) {
+            $script:notify.BalloonTipTitle = 'RAMMap 自动清理已在运行'
+            $script:notify.BalloonTipText  = '无需重复启动，右键托盘图标可操作或退出'
+            $script:notify.ShowBalloonTip(3000)
+        }
+    })
+    $script:pingTimer.Start()
+}
+
 # ============================================================================
 # 十三、右键菜单
 # ============================================================================
@@ -636,17 +660,37 @@ $miLog.Add_Click({
 
 $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
 
-# --- [退出] ---
-$miExit = $menu.Items.Add('退出')
-$miExit.Add_Click({
+# --- [退出] / [重启] ---
+# 共用收尾：停定时器 -> 收托盘 -> 记日志 -> 结束消息循环（进程随后落到末尾释放锁）
+function Stop-Tray($reason) {
     $script:timer.Stop()
     $script:checkTimer.Stop()
+    if ($script:pingTimer)  { $script:pingTimer.Stop() }
     if ($script:startupTimer) { $script:startupTimer.Stop() }   # 启动清理尚未触发时一并停掉
-    Write-Log '==== 托盘程序退出 ===='
+    Write-Log "==== 托盘程序${reason} ===="
     $script:notify.Visible = $false
     $script:notify.Dispose()
+    if ($script:pingEvent) { $script:pingEvent.Dispose() }
     $script:ctx.ExitThread()
+}
+
+$miRestart = $menu.Items.Add('重启托盘程序')
+$miRestart.Add_Click({
+    # 以当前管理员身份直接拉起新实例（不走 VBS→schtasks 链路，无 UAC 且更快）；
+    # 新实例启动时会先等本实例释放互斥锁（最长 15 秒），随后接管托盘
+    try {
+        Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @(
+            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Sta',
+            '-WindowStyle', 'Hidden', '-File', "`"$PSCommandPath`""
+        )
+        Stop-Tray '重启（新实例接管中）'
+    } catch {
+        Write-Log "重启失败: $($_.Exception.Message)"
+    }
 })
+
+$miExit = $menu.Items.Add('退出')
+$miExit.Add_Click({ Stop-Tray '退出' })
 
 # 挂载菜单与双击行为（双击托盘图标 = 立即清理）
 $script:notify.ContextMenuStrip = $menu
