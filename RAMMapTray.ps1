@@ -162,6 +162,12 @@ if (-not $isAdmin) {
         if ($arg -and $arg.Contains($vbsNow)) { $taskPointsToMe = $true }
     }
     if ($existingTask -and $taskPointsToMe) {
+        # 已有实例常驻时任务处于 Running：先 ping 旧实例弹气泡（是否真有实例由旧实例回应）；
+        # 若任务触发被并发策略吞掉，用户至少能得到"已在运行"的反馈
+        try {
+            $evt = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, $script:mutexName + '_ping')
+            $evt.Set(); $evt.Dispose()
+        } catch { }
         # 任务本身以最高权限运行，schtasks 只是触发器
         Start-Process schtasks.exe -ArgumentList @('/run', '/tn', $script:taskName) -WindowStyle Hidden
     } else {
@@ -375,7 +381,9 @@ function Set-AutoStart($enable) {
             $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
             try {
                 # ExecutionTimeLimit 为 0 = 不限时（默认 72 小时后任务会被强制停止）
-                $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero)
+                # MultipleInstances = Parallel：旧实例常驻时任务处于 Running，默认 IgnoreNew
+                #   会把后续 /run 触发静默吞掉（这正是"重复启动无任何反应"的原因）
+                $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances Parallel
             } catch {
                 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Days 365)
             }
@@ -508,13 +516,18 @@ try {
     $script:pingEvent = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, $script:mutexName + '_ping')
 } catch { }
 if ($script:pingEvent) {
+    $script:lastPingBalloon = [datetime]::MinValue   # 气泡防抖：启动链路可能连发两次 ping
     $script:pingTimer = New-Object System.Windows.Forms.Timer
     $script:pingTimer.Interval = 500
     $script:pingTimer.Add_Tick({
         if ($script:pingEvent.WaitOne(0)) {
-            $script:notify.BalloonTipTitle = 'RAMMap 自动清理已在运行'
-            $script:notify.BalloonTipText  = '无需重复启动，右键托盘图标可操作或退出'
-            $script:notify.ShowBalloonTip(3000)
+            # 5 秒内的重复 ping 只弹一次（快捷方式链路与 4.2 处各 ping 一次属正常双发）
+            if (((Get-Date) - $script:lastPingBalloon).TotalSeconds -ge 5) {
+                $script:notify.BalloonTipTitle = 'RAMMap 自动清理已在运行'
+                $script:notify.BalloonTipText  = '无需重复启动，右键托盘图标可操作或退出'
+                $script:notify.ShowBalloonTip(3000)
+                $script:lastPingBalloon = Get-Date
+            }
         }
     })
     $script:pingTimer.Start()
