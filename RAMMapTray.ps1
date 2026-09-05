@@ -40,8 +40,10 @@ $script:autoCleanEnabled     = $true # 自动清理开关（重启不丢，持�
 $script:memWatchEnabled      = $true # 内存监控开关（重启不丢，持久化）
 
 # 游戏进程名：检测到任一在运行时，清理自动切换"游戏保护模式"（跳过游戏进程）
+# 含游戏启动器：HYP/HYPHelper 为米哈游启动器，启动期工作集被清空会导致游戏
+#   等待启动器响应超时而挂起（AppHangXProcB1），必须一并保护
 # 名单可在 rammap_tray_config.json 的 "gameProcessNames" 中增删（无此键则用下面的默认值）
-$script:gameProcessNames = @('YuanShen', 'GenshinImpact', 'GenshinImpact-2')
+$script:gameProcessNames = @('YuanShen', 'GenshinImpact', 'GenshinImpact-2', 'HYP', 'HYPHelper', 'StarRail')
 
 # 系统关键进程：游戏保护模式下同样跳过，避免桌面/声音/安全组件出现卡顿
 $script:systemProtectedNames = @(
@@ -54,6 +56,7 @@ $script:systemProtectedNames = @(
 
 # 路径与常量
 $script:rammapDir = 'E:\Software\RAMMap\RAMMap'                        # RAMMap 所在目录
+$script:configVersion = 1
 $script:logFile   = Join-Path $PSScriptRoot 'rammap_auto.log'          # 日志文件
 $script:configFile = Join-Path $PSScriptRoot 'rammap_tray_config.json' # 参数持久化文件
 $script:vbsPath   = Join-Path $PSScriptRoot '启动RAMMap自动清理.vbs'    # 无窗口启动器
@@ -76,6 +79,10 @@ $script:configRanges = @{   # 各参数的合法范围（与菜单输入校验�
 if (Test-Path $script:configFile) {
     try {
         $saved = Get-Content $script:configFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($saved.rammapDir -and -not [string]::IsNullOrWhiteSpace([string]$saved.rammapDir)) {
+            $candidateDir = [Environment]::ExpandEnvironmentVariables(([string]$saved.rammapDir).Trim())
+            if (Test-Path $candidateDir -PathType Container) { $script:rammapDir = $candidateDir }
+        }
         foreach ($key in @('intervalMinutes', 'checkIntervalMinutes', 'memThresholdPercent', 'skipBelowPercent')) {
             $n = 0
             if ($saved.$key -ne $null -and [int]::TryParse("$($saved.$key)", [ref]$n)) {
@@ -90,7 +97,11 @@ if (Test-Path $script:configFile) {
         if ($saved.autoCleanEnabled  -ne $null) { $script:autoCleanEnabled  = [bool]$saved.autoCleanEnabled }
         if ($saved.memWatchEnabled   -ne $null) { $script:memWatchEnabled   = [bool]$saved.memWatchEnabled }
         if ($saved.gameProcessNames) {            # 游戏名单：json 数组覆盖默认值（空数组视为未配置）
-            $names = @($saved.gameProcessNames | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            $names = @($saved.gameProcessNames | ForEach-Object {
+                if (-not [string]::IsNullOrWhiteSpace([string]$_)) {
+                    ([string]$_).Trim() -replace '(?i)\.exe$',''
+                }
+            } | Where-Object { $_ })
             if ($names.Count -gt 0) { $script:gameProcessNames = $names }
         }
     } catch { }   # 配置文件损坏时静默使用默认值
@@ -99,7 +110,9 @@ if (Test-Path $script:configFile) {
 # 保存当前参数到 json（菜单"参数设置"修改后调用）
 function Save-Config {
     try {
-        @{ intervalMinutes      = $script:intervalMinutes
+        @{ configVersion        = $script:configVersion
+           rammapDir             = $script:rammapDir
+           intervalMinutes      = $script:intervalMinutes
            checkIntervalMinutes = $script:checkIntervalMinutes
            memThresholdPercent  = $script:memThresholdPercent
            skipBelowPercent     = $script:skipBelowPercent
@@ -241,23 +254,58 @@ if (-not $script:rammapPath) {
 }
 
 Write-Log "==== 托盘程序启动（管理员）: $script:rammapPath ===="
+Write-Log ("环境: PowerShell {0}, OS {1}, 脚本目录 {2}, 配置版本 {3}" -f $PSVersionTable.PSVersion, [Environment]::OSVersion.Version, $PSScriptRoot, $script:configVersion)
 Write-Log ("配置: 定时保养每 {0} 分钟(仅占用 {3}%-{2}% 区间); 内存监控每 {1} 分钟检查, 占用超过 {2}% 立即清理; 占用低于 {3}% 时定时保养/启动清理自动跳过" -f `
     $script:intervalMinutes, $script:checkIntervalMinutes, $script:memThresholdPercent, $script:skipBelowPercent)
 
 # ============================================================================
 # 七、内存查询
 # ============================================================================
+# GlobalMemoryStatusEx 内核 API 封装：WMI 失效时的兜底数据源（按需编译）
+# 背景：WMI 服务/仓库损坏时 Get-CimInstance 会抛错或返回空，导致监控读数恒为 0%
+#       完全失明（曾因此漏掉原神启动期间的内存清理触发）；内核 API 不依赖 WMI
+$script:k32Compiled      = $false
+$script:wmiFallbackLogged = $false
+
+function Add-K32Api {
+    if ($script:k32Compiled) { return }
+    Add-Type -Namespace Win32 -Name K32Ex -MemberDefinition @'
+[StructLayout(LayoutKind.Sequential)]
+public struct MEMORYSTATUSEX { public uint dwLength; public uint dwMemoryLoad; public ulong ullTotalPhys; public ulong ullAvailPhys; public ulong ullTotalPageFile; public ulong ullAvailPageFile; public ulong ullTotalVirtual; public ulong ullAvailVirtual; public ulong ullAvailExtendedVirtual; }
+[DllImport("kernel32.dll")] public static extern bool GlobalMemoryStatusEx(ref MEMORYSTATUSEX buf);
+'@
+    $script:k32Compiled = $true
+}
+
+function Get-MemoryStatus {
+    # 返回 @{ TotalGB / FreeGB }：优先 WMI；WMI 失败或返回无效值时退回内核 API
+    $os = $null
+    try { $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop } catch { }
+    if ($os -and $os.TotalVisibleMemorySize -gt 0) {
+        return @{ TotalGB = [double]$os.TotalVisibleMemorySize * 1KB / 1GB
+                  FreeGB  = [double]$os.FreePhysicalMemory  * 1KB / 1GB }
+    }
+    if (-not $script:wmiFallbackLogged) {   # 只记一次，避免日志刷屏
+        Write-Log "[警告] WMI 内存查询失败，已切换内核 API 兜底（建议检查 WMI 服务）"
+        $script:wmiFallbackLogged = $true
+    }
+    Add-K32Api
+    $m = New-Object 'Win32.K32Ex+MEMORYSTATUSEX'
+    $m.dwLength = 64
+    [void][Win32.K32Ex]::GlobalMemoryStatusEx([ref]$m)
+    return @{ TotalGB = $m.ullTotalPhys / 1GB; FreeGB = $m.ullAvailPhys / 1GB }
+}
+
 function Get-FreeGB {
     # 当前可用物理内存（GB）
-    [math]::Round((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory * 1KB / 1GB, 2)
+    [math]::Round((Get-MemoryStatus).FreeGB, 2)
 }
 
 function Get-UsagePct {
     # 当前物理内存占用率（%）
-    $os    = Get-CimInstance Win32_OperatingSystem
-    $total = [double]$os.TotalVisibleMemorySize
-    if ($total -le 0) { return 0 }
-    [math]::Round((($total - [double]$os.FreePhysicalMemory) / $total) * 100, 1)
+    $s = Get-MemoryStatus
+    if ($s.TotalGB -le 0) { return 0 }
+    [math]::Round((($s.TotalGB - $s.FreeGB) / $s.TotalGB) * 100, 1)
 }
 
 # ============================================================================
@@ -265,7 +313,8 @@ function Get-UsagePct {
 # ============================================================================
 function Test-GameRunning {
     foreach ($n in $script:gameProcessNames) {
-        if (Get-Process -Name $n -ErrorAction SilentlyContinue) { return $true }
+        $normalized = ([string]$n).Trim() -replace '(?i)\.exe$',''
+        if (Get-Process -Name $normalized -ErrorAction SilentlyContinue) { return $true }
     }
     return $false
 }
@@ -295,7 +344,12 @@ function Add-Win32Api {
 
 # 模式 A：全局清理（游戏未运行时）
 function Invoke-GlobalCleanup {
-    Start-Process -FilePath $script:rammapPath -ArgumentList '-Ew' -Wait -WindowStyle Hidden
+    $proc = Start-Process -FilePath $script:rammapPath -ArgumentList '-Ew' -PassThru -WindowStyle Hidden
+    if (-not $proc.WaitForExit(120000)) {
+        try { $proc.Kill() } catch { }
+        throw "RAMMap 清理超时（超过 120 秒）"
+    }
+    if ($proc.ExitCode -ne 0) { throw "RAMMap 清理失败，退出码: $($proc.ExitCode)" }
     Start-Sleep -Milliseconds 1500   # 等待内存计数器稳定后再统计释放量
 }
 
@@ -305,8 +359,8 @@ function Invoke-ProtectedCleanup {
     $cleaned = 0
     Get-Process | ForEach-Object {
         $p = $_
-        if ($script:gameProcessNames -contains $p.Name)        { return }  # 绝不动游戏
-        if ($script:systemProtectedNames -contains $p.Name)    { return }  # 不动系统关键进程
+        if ($script:gameProcessNames | Where-Object { $_ -ieq $p.Name })     { return }  # 绝不动游戏
+        if ($script:systemProtectedNames | Where-Object { $_ -ieq $p.Name }) { return }  # 不动系统关键进程
         if ($p.WorkingSet64 -lt ($script:minWorkingSetMB * 1MB)) { return } # 太小无意义
         try {
             # PROCESS_SET_QUOTA(0x0100) | PROCESS_QUERY_INFORMATION(0x0400)，
@@ -330,6 +384,7 @@ function Invoke-ProtectedCleanup {
 $script:cooldownMinutes = $script:checkIntervalMinutes
 function Invoke-Cleanup($trigger) {
     try {
+        $startedAt = Get-Date
         # --- 冷却防抖：仅约束自动触发源（定时/内存触发），手动与启动豁免 ---
         $elapsed = [int]((Get-Date) - $script:lastCleanup).TotalMinutes
         if (($trigger -eq '定时' -or $trigger -eq '内存触发') -and $elapsed -lt $script:cooldownMinutes) {
@@ -357,7 +412,8 @@ function Invoke-Cleanup($trigger) {
         $after = Get-FreeGB
         $freed = [math]::Round($after - $before, 2)
         $script:lastCleanup = Get-Date
-        Write-Log ("[{0}] {1}: 可用物理内存 {2}GB -> {3}GB (释放 {4}GB)" -f $trigger, $label, $before, $after, $freed)
+        $duration = [math]::Round(((Get-Date) - $startedAt).TotalSeconds, 1)
+        Write-Log ("[{0}] {1}: 可用物理内存 {2}GB -> {3}GB (释放 {4}GB, 耗时 {5}秒)" -f $trigger, $label, $before, $after, $freed, $duration)
         Update-Tip ("{0} 释放{1}GB 可用{2}GB" -f (Get-Date -Format 'HH:mm'), $freed, $after)
     } catch {
         Write-Log "执行失败: $($_.Exception.Message)"
@@ -482,6 +538,25 @@ function Confirm-RAMMapRunning {
             Write-Log "启动 RAMMap 失败: $($_.Exception.Message)"
         }
     }
+}
+
+function Select-RAMMapDirectory {
+    $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dialog.Description = '选择 RAMMap 所在目录（需包含 RAMMap64.exe 或 RAMMap.exe）'
+    $dialog.SelectedPath = $script:rammapDir
+    if ($dialog.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
+    $newDir = $dialog.SelectedPath
+    $candidate = @((Join-Path $newDir 'RAMMap64.exe'), (Join-Path $newDir 'RAMMap.exe')) |
+        Where-Object { Test-Path $_ } | Select-Object -First 1
+    if (-not $candidate) {
+        [System.Windows.Forms.MessageBox]::Show('所选目录中未找到 RAMMap64.exe 或 RAMMap.exe。', 'RAMMap 自动清理', 'OK', 'Error') | Out-Null
+        return
+    }
+    $script:rammapDir = $newDir
+    $script:rammapPath = $candidate
+    Save-Config
+    Write-Log "RAMMap 路径已修改: $script:rammapPath"
+    [System.Windows.Forms.MessageBox]::Show('路径已保存。请重启托盘程序使新路径和图标完全生效。', 'RAMMap 自动清理', 'OK', 'Information') | Out-Null
 }
 
 # ============================================================================
@@ -674,6 +749,9 @@ Refresh-MenuTexts   # 菜单文字带上当前参数值
 $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
 
 # --- [工具] 打开 RAMMap / 查看日志 ---
+$miPath = $menu.Items.Add('设置 RAMMap 目录')
+$miPath.Add_Click({ Select-RAMMapDirectory })
+
 $miOpen = $menu.Items.Add('打开 RAMMap 窗口')
 $miOpen.Add_Click({ Confirm-RAMMapRunning })
 
