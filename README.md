@@ -1,107 +1,74 @@
 # RAMMapAuto
 
-Windows 内存自动清理托盘常驻工具。基于 PowerShell + [Sysinternals RAMMap](https://learn.microsoft.com/sysinternals/downloads/rammap)，定时清空进程工作集（Working Set），并在游戏运行时自动切换保护模式，防止游戏因内存被换出而卡顿。
+Windows 内存自动清理托盘工具，基于 PowerShell 和 Sysinternals RAMMap，支持定时保养、内存阈值监控、手动清理和游戏保护模式。
 
-## 功能特性
+## 功能
 
-- **定时保养**：默认每 30 分钟清理一次，仅在占用 60%-80% 区间生效（1-1440 分钟可调）
-- **内存监控**：默认每 5 分钟检查占用，超过阈值（默认 80%）立即清理
-- **手动清理**：菜单/双击托盘图标，无条件执行，不受任何阈值限制
-- **游戏保护模式**：检测到游戏进程时自动改用逐进程清理，跳过游戏与系统关键进程
-- **游戏名单可配置**：在配置 JSON 中增删受保护的游戏，无需改脚本
-- **托盘常驻**：右键菜单控制一切，双击图标立即清理
-- **开机自启**：借道计划任务以最高权限静默启动，全程无 UAC 弹窗
-- **参数持久化**：所有设置与开关状态保存到 JSON，重启不丢
-- **位置自愈**：文件夹整体移动后自动修复自启任务与桌面快捷方式
-- **日志轮转**：运行日志超 512KB 自动截断，不会无限增长
+- 定时保养：按设定间隔清理，低于低占用阈值时跳过。
+- 内存监控：周期检查物理内存，超过阈值立即清理。
+- 手动清理：托盘菜单或双击托盘图标，无条件执行。
+- 游戏保护：检测到游戏后逐进程清理，跳过游戏和系统关键进程。
+- 托盘控制：开关自动清理、内存监控、开机启动，打开 RAMMap 和日志。
+- 路径自愈、单实例保护、日志轮转和清理超时保护。
 
-## 依赖
+## 环境要求
 
-- Windows 10 / 11
-- PowerShell 5.1+（系统自带）
-- [RAMMap](https://learn.microsoft.com/sysinternals/downloads/rammap)（Sysinternals）——默认路径 `E:\Software\RAMMap\RAMMap`，请按实际位置修改脚本顶部 `$rammapDir`
+- Windows 10/11
+- Windows PowerShell 5.1+
+- RAMMap 目录中存在 `RAMMap64.exe` 或 `RAMMap.exe`
+- 首次运行允许管理员权限
 
-## 使用方法
+## 使用
 
-1. 下载 `RAMMapTray.ps1` 与 `启动RAMMap自动清理.vbs`，放入同一目录
-2. 修改脚本顶部 `$rammapDir` 为你的 RAMMap 所在目录
-3. 右键 `RAMMapTray.ps1` →「使用 PowerShell 运行」，首次会请求一次管理员权限（UAC）
-4. 程序常驻托盘，右键图标即可操作：
+双击 `启动RAMMap自动清理.vbs`，或直接运行 `RAMMapTray.ps1`。程序启动后驻留系统托盘，右键图标操作。RAMMap 不在默认目录时，使用“设置 RAMMap 目录”选择目录，程序会验证并保存路径。
 
-```
-立即清理内存
-────────────
-☑ 定时保养（每 30 分钟，占用 60%-80% 之间）
-☑ 内存监控（每 5 分钟检查，超 80% 立即清理）
-☑ 开机自动启动
-参数设置 ▸  定时保养间隔 / 内存检查间隔 / 清理阈值 / 低占用跳过
-────────────
-打开 RAMMap 窗口
-查看日志
-────────────
-重启托盘程序
-退出
-```
+## 配置
 
-## 清理策略
-
-三个触发源各管一段，互不重叠（默认参数下）：
-
-| 触发源 | 生效区间 | 冷却防抖 | 低占用跳过 | 说明 |
-|--------|---------|:---:|:---:|------|
-| 手动（菜单/双击） | 任意占用 | 豁免 | 豁免 | 用户明确意图，无条件执行 |
-| 内存触发 | 占用 ≥ 80% | 受限 | 豁免 | 高频检查，快速响应 |
-| 定时保养 | 占用 60%-80% | 受限 | 受限 | 中段周期性保养，防止缓慢爬升触顶 |
-| 启动 | 开机后一次 | 豁免 | 受限 | 异步执行，不阻塞托盘启动 |
-
-游戏未运行时使用 `RAMMap -Ew` 全局清理（释放量最大）；检测到游戏进程时改用 `EmptyWorkingSet` API 逐进程清理，跳过游戏及约 28 个系统关键进程（dwm / explorer / audiodg 等）。
-
-## 配置文件
-
-`rammap_tray_config.json`（首次从菜单保存参数后生成）：
+配置文件为 `rammap_tray_config.json`，由程序自动保存；删除后恢复默认值。
 
 ```json
 {
-    "intervalMinutes": 30,
-    "checkIntervalMinutes": 5,
-    "memThresholdPercent": 80,
-    "skipBelowPercent": 60,
-    "autoStartEnabled": true,
-    "autoCleanEnabled": true,
-    "memWatchEnabled": true,
-    "gameProcessNames": ["YuanShen", "GenshinImpact"]
+  "configVersion": 1,
+  "rammapDir": "E:\\Software\\RAMMap\\RAMMap",
+  "intervalMinutes": 30,
+  "checkIntervalMinutes": 2,
+  "memThresholdPercent": 80,
+  "skipBelowPercent": 60,
+  "autoStartEnabled": true,
+  "autoCleanEnabled": true,
+  "memWatchEnabled": true,
+  "gameProcessNames": ["YuanShen", "GenshinImpact", "GenshinImpact-2", "HYP", "HYPHelper", "StarRail"]
 }
 ```
 
-- 删除该文件即恢复脚本默认值
-- `gameProcessNames` 填游戏进程名（不带 `.exe`），检测到任一在运行即进入保护模式
+范围：`intervalMinutes` 为 1-1440；`checkIntervalMinutes` 为 1-60，并作为自动清理冷却时间；`memThresholdPercent` 为 50-95；`skipBelowPercent` 为 0-90。游戏进程名可带 `.exe`，匹配时忽略大小写。
 
-## 工作原理
+## 清理策略
 
-1. **无 UAC 常驻**：首次运行注册计划任务（最高权限 + 登录触发），之后 `wscript` 静默启动 PowerShell 脚本，借 `schtasks /run` 触发提权实例，全程无弹窗
-2. **单实例保护**：互斥锁保证单实例；已有实例运行时重复启动仅弹气泡提醒"已在运行"，不打扰旧实例。托盘菜单提供一键重启（新实例直接以管理员身份接管）
-3. **清理机制**：`RAMMap -Ew` 或 `EmptyWorkingSet`（等价 `SetProcessWorkingSetSize(-1,-1)`）将工作集页面移出物理内存，逼迫系统释放 standby list 供活跃进程使用
+游戏未运行时调用 `RAMMap -Ew` 全局清理。游戏运行时调用 Win32 `EmptyWorkingSet` 逐进程清理，跳过游戏、系统关键进程和工作集小于 50 MB 的进程。自动触发受冷却时间和低占用阈值限制；手动清理不受限制。RAMMap 执行超过 120 秒会终止并写入日志，非零退出码也会记录。
 
-## 文件说明
+## 自检
+
+以下命令只检查脚本语法、配置 JSON 和 RAMMap 路径，不启动托盘或执行清理：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Test-RAMMapTray.ps1
+```
+
+## 日志与排查
+
+`rammap_auto.log` 可通过托盘菜单“查看日志”打开。找不到 RAMMap 时检查目录和文件名；开机启动异常时检查 `RAMMapAutoTray` 计划任务；清理异常时查看日志中的退出码、耗时和异常信息。
+
+## 文件
 
 | 文件 | 说明 |
-|------|------|
-| `RAMMapTray.ps1` | 主脚本（需 UTF-8 BOM 编码） |
-| `启动RAMMap自动清理.vbs` | 无窗口启动器（计划任务与快捷方式入口） |
-| `rammap_tray_config.json` | 参数持久化（本地生成，不入库） |
-| `rammap_auto.log` | 运行日志（本地生成，不入库） |
+| --- | --- |
+| `RAMMapTray.ps1` | 主程序和托盘菜单 |
+| `启动RAMMap自动清理.vbs` | 隐藏窗口启动器 |
+| `rammap_tray_config.json` | 本地配置 |
+| `rammap_auto.log` | 运行日志 |
+| `Test-RAMMapTray.ps1` | 无副作用自检 |
 
-## 常见问题
-
-**Q: 为什么手动清理后可用内存很快又降回去了？**
-工作集清理只是把不活跃页面换出，进程再次活跃时页面会被调回。本工具的价值在于周期性压缩内存占用峰值，适合物理内存偏小的机器。
-
-**Q: 游戏保护模式能保护其他游戏吗？**
-可以，把游戏进程名加入配置文件的 `gameProcessNames` 即可。
-
-**Q: 提示找不到 RAMMap？**
-修改脚本顶部 `$rammapDir` 为实际安装目录，确保其中存在 `RAMMap64.exe` 或 `RAMMap.exe`。
-
-## License
+## 许可证
 
 [MIT](LICENSE)
