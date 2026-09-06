@@ -76,6 +76,15 @@ $script:configRanges = @{   # 各参数的合法范围（与菜单输入校验�
     skipBelowPercent     = @(0, 90)
 }
 
+# 进程名归一化：Trim + 去 .exe 后缀（默认值与 json 来源统一处理，匹配本身忽略大小写）
+function Get-NormalizedProcessNames($names) {
+    @($names | ForEach-Object {
+        if (-not [string]::IsNullOrWhiteSpace([string]$_)) {
+            ([string]$_).Trim() -replace '(?i)\.exe$',''
+        }
+    } | Where-Object { $_ })
+}
+
 if (Test-Path $script:configFile) {
     try {
         $saved = Get-Content $script:configFile -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -97,30 +106,34 @@ if (Test-Path $script:configFile) {
         if ($saved.autoCleanEnabled  -ne $null) { $script:autoCleanEnabled  = [bool]$saved.autoCleanEnabled }
         if ($saved.memWatchEnabled   -ne $null) { $script:memWatchEnabled   = [bool]$saved.memWatchEnabled }
         if ($saved.gameProcessNames) {            # 游戏名单：json 数组覆盖默认值（空数组视为未配置）
-            $names = @($saved.gameProcessNames | ForEach-Object {
-                if (-not [string]::IsNullOrWhiteSpace([string]$_)) {
-                    ([string]$_).Trim() -replace '(?i)\.exe$',''
-                }
-            } | Where-Object { $_ })
+            $names = Get-NormalizedProcessNames $saved.gameProcessNames
             if ($names.Count -gt 0) { $script:gameProcessNames = $names }
         }
     } catch { }   # 配置文件损坏时静默使用默认值
 }
 
+# 默认名单同样归一化，保证两种来源格式一致（后续 Test-GameRunning 直接整表查询）
+$script:gameProcessNames = Get-NormalizedProcessNames $script:gameProcessNames
+
 # 保存当前参数到 json（菜单"参数设置"修改后调用）
 function Save-Config {
     try {
-        @{ configVersion        = $script:configVersion
-           rammapDir             = $script:rammapDir
-           intervalMinutes      = $script:intervalMinutes
-           checkIntervalMinutes = $script:checkIntervalMinutes
-           memThresholdPercent  = $script:memThresholdPercent
-           skipBelowPercent     = $script:skipBelowPercent
-           autoStartEnabled     = $script:autoStartEnabled
-           autoCleanEnabled     = $script:autoCleanEnabled
-           memWatchEnabled      = $script:memWatchEnabled
-           gameProcessNames     = $script:gameProcessNames
-        } | ConvertTo-Json | Set-Content -Path $script:configFile -Encoding UTF8
+        $json = @{ configVersion        = $script:configVersion
+                   rammapDir             = $script:rammapDir
+                   intervalMinutes      = $script:intervalMinutes
+                   checkIntervalMinutes = $script:checkIntervalMinutes
+                   memThresholdPercent  = $script:memThresholdPercent
+                   skipBelowPercent     = $script:skipBelowPercent
+                   autoStartEnabled     = $script:autoStartEnabled
+                   autoCleanEnabled     = $script:autoCleanEnabled
+                   memWatchEnabled      = $script:memWatchEnabled
+                   gameProcessNames     = $script:gameProcessNames
+        } | ConvertTo-Json
+        # 先写临时文件再原子替换：断电/崩溃时不会留下半截 JSON（损坏时本程序会静默回默认值）
+        # UTF8Encoding($true) 带 BOM，与原 Set-Content -Encoding UTF8（PS5.1）产出保持一致
+        $tmp = "$script:configFile.tmp"
+        [System.IO.File]::WriteAllText($tmp, $json, (New-Object System.Text.UTF8Encoding($true)))
+        Move-Item -Force -Path $tmp -Destination $script:configFile
     } catch {
         Write-Log "参数保存失败: $($_.Exception.Message)"
     }
@@ -301,9 +314,11 @@ function Get-FreeGB {
     [math]::Round((Get-MemoryStatus).FreeGB, 2)
 }
 
-function Get-UsagePct {
-    # 当前物理内存占用率（%）
+function Get-UsagePct([ref]$statusOut) {
+    # 当前物理内存占用率（%）。传入 $statusOut 时一并带回完整内存状态，
+    # 调用方需要“占用率+可用量”时复用同一次查询，不再二次发起 WMI/内核 API 调用
     $s = Get-MemoryStatus
+    if ($statusOut) { $statusOut.Value = $s }
     if ($s.TotalGB -le 0) { return 0 }
     [math]::Round((($s.TotalGB - $s.FreeGB) / $s.TotalGB) * 100, 1)
 }
@@ -312,11 +327,10 @@ function Get-UsagePct {
 # 八、游戏检测
 # ============================================================================
 function Test-GameRunning {
-    foreach ($n in $script:gameProcessNames) {
-        $normalized = ([string]$n).Trim() -replace '(?i)\.exe$',''
-        if (Get-Process -Name $normalized -ErrorAction SilentlyContinue) { return $true }
-    }
-    return $false
+    # 名单在配置加载时已统一归一化，这里一次 Get-Process 同时查所有游戏名
+    # （N 次系统调用 -> 1 次）；监控 tick 与托盘提示刷新会高频调用本函数
+    if ($script:gameProcessNames.Count -eq 0) { return $false }
+    return [bool](Get-Process -Name $script:gameProcessNames -ErrorAction SilentlyContinue)
 }
 
 # ============================================================================
@@ -359,8 +373,10 @@ function Invoke-ProtectedCleanup {
     $cleaned = 0
     Get-Process | ForEach-Object {
         $p = $_
-        if ($script:gameProcessNames | Where-Object { $_ -ieq $p.Name })     { return }  # 绝不动游戏
-        if ($script:systemProtectedNames | Where-Object { $_ -ieq $p.Name }) { return }  # 不动系统关键进程
+        if ($p.Id -eq $PID) { return }   # 绝不动自己（托盘宿主进程）
+        # -contains 为忽略大小写的数组扫描，替代逐名 Where-Object 管道（每进程省 2 条管道）
+        if ($script:gameProcessNames -contains $p.Name)     { return }  # 绝不动游戏
+        if ($script:systemProtectedNames -contains $p.Name) { return }  # 不动系统关键进程
         if ($p.WorkingSet64 -lt ($script:minWorkingSetMB * 1MB)) { return } # 太小无意义
         try {
             # PROCESS_SET_QUOTA(0x0100) | PROCESS_QUERY_INFORMATION(0x0400)，
@@ -393,14 +409,17 @@ function Invoke-Cleanup($trigger) {
 
         # --- 低占用跳过：内存充裕时清理收益小于换页代价（定时/启动受限；手动/内存触发不受限） ---
         # 手动点击"立即清理"是用户明确意图，无条件执行；
-        # 启动清理受门槛约束：刚开机占用通常不高，跳过可避免最耗时的驱动冷加载挡住启动
-        $usage = Get-UsagePct
-        if (($trigger -eq '定时' -or $trigger -eq '启动') -and $usage -lt $script:skipBelowPercent) {
-            Write-Log ("[{0}] 占用 {1}% 低于 {2}%，跳过清理" -f $trigger, $usage, $script:skipBelowPercent)
-            Update-Tip ("占用{0}% 可用{1}GB（低于阈值未清理）" -f $usage, (Get-FreeGB))
-            return
+        # 启动清理受门槛约束：刚开机占用通常不高，跳过可避免最耗时的驱动冷加载挡住启动。
+        # WMI 查询仅定时/启动需要（判断是否跳过）：手动/内存触发省一次较慢的 CIM 调用
+        if ($trigger -eq '定时' -or $trigger -eq '启动') {
+            $status = $null
+            $usage = Get-UsagePct ([ref]$status)   # 一次查询同时取占用率与可用量
+            if ($usage -lt $script:skipBelowPercent) {
+                Write-Log ("[{0}] 占用 {1}% 低于 {2}%，跳过清理" -f $trigger, $usage, $script:skipBelowPercent)
+                Update-Tip ("占用{0}% 可用{1}GB（低于阈值未清理）" -f $usage, [math]::Round($status.FreeGB, 2))
+                return
+            }
         }
-
         $before = Get-FreeGB
         if (Test-GameRunning) {
             $count = Invoke-ProtectedCleanup
@@ -476,15 +495,18 @@ function Repair-Locations {
                 Unregister-ScheduledTask -TaskName $script:taskName -Confirm:$false -ErrorAction SilentlyContinue
             }
             Write-Log "位置自愈: 检测到路径变化，已按新位置 [$PSScriptRoot] 修复自启设置"
+            # 修复后重查再返回：返回值供启动流程判断是否还需注册/注销，
+            # 若仍带回修复前的旧对象（$null/旧路径），启动流程会重复注册/注销一次
+            $task = Get-ScheduledTask -TaskName $script:taskName -ErrorAction SilentlyContinue
         }
 
         # 桌面快捷方式：存在但指向别处 -> 重建指向当前 VBS
         $lnk = Join-Path ([Environment]::GetFolderPath('Desktop')) 'RAMMap 自动清理.lnk'
         if (Test-Path $lnk) {
-            $sh  = New-Object -ComObject WScript.Shell
-            $cur = $sh.CreateShortcut($lnk).TargetPath + ' ' + $sh.CreateShortcut($lnk).Arguments
+            $sh = New-Object -ComObject WScript.Shell
+            $s  = $sh.CreateShortcut($lnk)   # 同一 COM 对象复用，避免重复创建
+            $cur = $s.TargetPath + ' ' + $s.Arguments
             if ($cur -notmatch [regex]::Escape($script:vbsPath)) {
-                $s = $sh.CreateShortcut($lnk)
                 $s.TargetPath  = 'wscript.exe'
                 $s.Arguments   = "`"$script:vbsPath`""
                 $s.WorkingDirectory = $PSScriptRoot
@@ -573,13 +595,14 @@ $script:checkTimer = New-Object System.Windows.Forms.Timer
 $script:checkTimer.Interval = $script:checkIntervalMinutes * 60 * 1000
 $script:checkTimer.Add_Tick({
     if (-not ($script:miMem -and $script:miMem.Checked)) { return }   # 监控已关则跳过
-    $usage = Get-UsagePct
+    $status = $null
+    $usage = Get-UsagePct ([ref]$status)   # 一次查询同时取占用率与可用量
     # 冷却防抖已在 Invoke-Cleanup 入口统一执行（原此处的 $mins 判断已移除）
     if ($usage -gt $script:memThresholdPercent) {
         Write-Log "[监控] 内存占用 ${usage}% 超过 ${script:memThresholdPercent}%，立即清理"
         Invoke-Cleanup '内存触发'
     } else {
-        Update-Tip ("占用{0}% 可用{1}GB" -f $usage, (Get-FreeGB))   # 未达标也刷新提示
+        Update-Tip ("占用{0}% 可用{1}GB" -f $usage, [math]::Round($status.FreeGB, 2))   # 未达标也刷新提示
     }
 })
 
@@ -827,7 +850,9 @@ $script:startupTimer.Add_Tick({
     $script:startupTimer.Stop()
     $script:startupTimer.Dispose()
     Invoke-Cleanup '启动'
-    Update-Tip ("占用{0}% 可用{1}GB" -f (Get-UsagePct), (Get-FreeGB))
+    $status = $null
+    $u = Get-UsagePct ([ref]$status)   # 一次查询同时取占用率与可用量
+    Update-Tip ("占用{0}% 可用{1}GB" -f $u, [math]::Round($status.FreeGB, 2))
 })
 $script:startupTimer.Start()
 

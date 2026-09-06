@@ -4,3 +4,6 @@ rammap_auto.log
 # 用户本地配置（含个人偏好与游戏进程名单）
 # 如需提交模板，可参考仓库中的说明自行创建
 rammap_tray_config.json
+
+# 编辑器/助手本地工作目录
+.mimosa/
